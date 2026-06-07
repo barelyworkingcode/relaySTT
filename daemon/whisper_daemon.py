@@ -30,6 +30,12 @@ class WhisperDaemon:
         self.idle_timeout = idle_timeout
         self.last_activity = None
         self.activity_lock = threading.Lock()
+        # Serializes all model access. mlx-whisper / MLX-Metal are not
+        # thread-safe; two overlapping transcribe() calls race on shared Metal
+        # state and can segfault the whole daemon (the same failure the Kokoro
+        # TTS daemon hit — see eve docs/learned.md). The daemon threads one
+        # connection per client, so this lock is the only thing serializing them.
+        self.gen_lock = threading.Lock()
 
     def update_activity(self):
         with self.activity_lock:
@@ -89,8 +95,19 @@ class WhisperDaemon:
         except Exception as e:
             print(f"Warmup failed (non-fatal): {e}")
 
+    def _empty_result(self, language):
+        return {"text": "", "language": language or "unknown", "duration": 0, "transcription_time": 0}
+
     def transcribe(self, audio_bytes, language=None):
         """Transcribe audio bytes and return text + metadata."""
+        # Guard the model from obviously-invalid payloads. A malformed/empty
+        # buffer (e.g. a truncated or zero-length capture) can take the native
+        # mlx-whisper layer down with it, so bail with an empty result instead
+        # of feeding it garbage. A valid WAV header alone is 44 bytes.
+        if not audio_bytes or len(audio_bytes) < 44:
+            print(f"Rejecting tiny audio payload ({len(audio_bytes) if audio_bytes else 0} bytes)")
+            return self._empty_result(language)
+
         # Write audio to temp file (mlx_whisper expects a file path)
         tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
         try:
@@ -101,24 +118,31 @@ class WhisperDaemon:
             # Probe format and convert to 16kHz mono WAV if needed
             wav_path = self._ensure_wav(tmp.name)
 
-            t0 = time.time()
+            # Confirm the (possibly converted) file is decodable audio before
+            # touching the model — an unreadable file would otherwise crash it.
+            try:
+                import soundfile as sf
+                duration = sf.info(wav_path).duration
+            except Exception as e:
+                print(f"Unreadable audio, skipping transcription: {e}")
+                return self._empty_result(language)
+            if duration <= 0:
+                return self._empty_result(language)
+
             kwargs = {"path_or_hf_repo": self.model_name}
             if language:
                 kwargs["language"] = language
 
-            result = self.mlx_whisper.transcribe(wav_path, **kwargs)
+            t0 = time.time()
+            # Serialize model access process-wide (see self.gen_lock). Global
+            # across connections, which per-client request chaining can't be —
+            # don't "optimize" it away.
+            with self.gen_lock:
+                result = self.mlx_whisper.transcribe(wav_path, **kwargs)
             transcription_time = time.time() - t0
 
             text = result.get("text", "").strip()
             detected_lang = result.get("language", language or "unknown")
-
-            # Estimate audio duration from file
-            try:
-                import soundfile as sf
-                info = sf.info(wav_path)
-                duration = info.duration
-            except Exception:
-                duration = 0
 
             print(f"Transcribed: {duration:.1f}s audio in {transcription_time:.2f}s lang={detected_lang} text='{text[:80]}'")
 
