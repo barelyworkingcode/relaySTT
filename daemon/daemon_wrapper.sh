@@ -1,12 +1,17 @@
 #!/bin/bash
-# Wrapper that activates the conda env and supervises the Whisper STT daemon.
+# Wrapper that activates the conda env and supervises the relaySTT daemon.
 
 # Activate conda environment
 CONDA_BASE="$(conda info --base)"
-source "${CONDA_BASE}/bin/activate" whisper
+source "${CONDA_BASE}/bin/activate" relaystt
 
 # Directory of this script
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Line-buffer the daemon's stdout/stderr so operational logs (engine mode, model
+# load, errors) reach Relay's logfile promptly instead of sitting in a block
+# buffer for the life of a long-running process. Mirrors relayTTS's wrapper.
+export PYTHONUNBUFFERED=1
 
 # Restart-on-crash supervision (mirrors the Kokoro TTS daemon).
 #
@@ -28,13 +33,13 @@ shutdown() { term=1; [ -n "$child" ] && kill -TERM "$child" 2>/dev/null; }
 trap shutdown TERM INT
 
 while true; do
-    python "$SCRIPT_DIR/whisper_daemon.py" --idle-timeout 0 "$@" &
+    python "$SCRIPT_DIR/relaystt_daemon.py" --idle-timeout 0 "$@" &
     child=$!
     wait "$child"
     code=$?
     if [ "$term" -eq 1 ] || [ "$code" -eq 0 ]; then
         break
     fi
-    echo "whisper daemon exited (code $code) — restarting in 2s" >&2
+    echo "relaystt daemon exited (code $code) — restarting in 2s" >&2
     sleep 2
 done

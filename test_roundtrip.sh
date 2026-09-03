@@ -1,5 +1,5 @@
 #!/bin/bash
-# Round-trip test: Kokoro TTS -> WAV file -> Whisper STT -> verify text matches
+# Round-trip test: TTS -> WAV file -> relaySTT -> verify text matches
 #
 # Usage:
 #   ./test_roundtrip.sh                               # default test phrase
@@ -14,7 +14,7 @@ WHISPER_HOST="${WHISPER_HOST:-localhost}"
 KNOWN_TEXT="${1:-The quick brown fox jumps over the lazy dog}"
 
 CONDA_BASE="$(conda info --base)"
-source "${CONDA_BASE}/bin/activate" whisper 2>/dev/null || true
+source "${CONDA_BASE}/bin/activate" relaystt 2>/dev/null || true
 
 python3 -c "
 import socket, struct, json, base64, sys, tempfile, os

@@ -12,7 +12,7 @@ HOST="${WHISPER_HOST:-localhost}"
 
 if [[ "${1:-}" == "--ping" ]]; then
     CONDA_BASE="$(conda info --base)"
-    source "${CONDA_BASE}/bin/activate" whisper 2>/dev/null || true
+    source "${CONDA_BASE}/bin/activate" relaystt 2>/dev/null || true
 
     python3 -c "
 import socket, struct, json, sys
@@ -53,7 +53,7 @@ if [ ! -f "$AUDIO_FILE" ]; then
 fi
 
 CONDA_BASE="$(conda info --base)"
-source "${CONDA_BASE}/bin/activate" whisper 2>/dev/null || true
+source "${CONDA_BASE}/bin/activate" relaystt 2>/dev/null || true
 
 python3 -c "
 import socket, struct, json, base64, sys
