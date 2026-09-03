@@ -48,7 +48,13 @@ if conda info --envs 2>/dev/null | grep -q "^${ENV_NAME} "; then
     pip install --upgrade $DEPS
 else
     echo "Creating conda environment '${ENV_NAME}'..."
-    conda create -n "$ENV_NAME" python=3.11 -y -c conda-forge
+    # --override-channels is load-bearing: without it conda still consults the
+    # implicit "defaults" channels, and a modern miniconda refuses to proceed
+    # until Anaconda's commercial Terms of Service are accepted —
+    #   CondaToSNonInteractiveError: Terms of Service have not been accepted
+    # which fails env creation outright on any fresh machine. conda-forge is
+    # what this line already asked for; this makes that actual.
+    conda create -n "$ENV_NAME" python=3.11 -y --override-channels -c conda-forge
     source "${CONDA_BASE}/bin/activate" "$ENV_NAME"
     pip install $DEPS
 fi
