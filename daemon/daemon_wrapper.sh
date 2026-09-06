@@ -15,11 +15,11 @@ export PYTHONUNBUFFERED=1
 
 # Restart-on-crash supervision (mirrors the Kokoro TTS daemon).
 #
-# The daemon wraps non-thread-safe native libs (mlx-whisper / MLX-Metal). A
-# gen_lock now serializes transcription so concurrent requests can't race the
-# model, but if the process ever still dies (a malformed-audio native fault,
-# OOM) we restart it so STT self-heals instead of staying dead until the next
-# Relay launch — the daemon is registered --autostart only, with no
+# The daemon holds no native model libs — it is a protocol shell over a
+# remote server — but ffmpeg still runs as a subprocess per request and the
+# process can still die (a malformed-audio fault, OOM). If it does, we
+# restart it so STT self-heals instead of staying dead until the next Relay
+# launch — the daemon is registered --autostart only, with no
 # restart-on-crash from Relay.
 #
 # Relay runs this wrapper as a process-group leader and stops the service by
