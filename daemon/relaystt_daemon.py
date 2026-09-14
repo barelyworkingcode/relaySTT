@@ -12,6 +12,7 @@ import os
 import socket
 import struct
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -21,6 +22,7 @@ import uuid
 import warnings
 
 import pinned_transport
+from launch_identity import LaunchIdentityError, establish_launch_identity
 
 warnings.filterwarnings("ignore")
 
@@ -441,7 +443,24 @@ class RelaySTTDaemon:
         print("Daemon stopped")
 
 
+def establish_relay_identity() -> bool:
+    """Fail closed: once relay has launched us, the daemon never runs without
+    the identity relay believes it has."""
+    try:
+        bound = establish_launch_identity()
+    except LaunchIdentityError as e:
+        print(f"relay launch identity failed: {e}", file=sys.stderr)
+        sys.exit(78)
+    if bound:
+        print("Relay launch identity established")
+    return bound
+
+
 def main():
+    # Deliberate: first, before argument parsing or config loading, so the
+    # launch pipe is drained and closed before anything (ffmpeg included)
+    # could spawn a child.
+    establish_relay_identity()
     parser = argparse.ArgumentParser(description="relaySTT Daemon")
     parser.add_argument("--host", default="localhost")
     parser.add_argument("--port", type=int, default=9998)
