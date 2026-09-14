@@ -131,6 +131,12 @@ Get a certificate's fingerprint with:
 openssl s_client -connect host:port </dev/null 2>/dev/null | openssl x509 -fingerprint -sha256 -noout
 ```
 
+## Relay launch identity
+
+When [Relay](https://relay.dev) launches the daemon, `daemon/launch_identity.py` drains the one-shot secret Relay hands over on fd 3 and presents it in a `Hello` on `RELAY_BRIDGE_SOCKET`, before anything else runs — no argument parsing, no config loading, no thread, no subprocess. Relay binds this process's kernel audit token as the daemon's identity; no relay credential is ever held in the environment. A failed handshake exits 78 without logging the secret, and `daemon/daemon_wrapper.sh` treats exit 78 as final (the launch secret is single-use, so a respawn could never succeed) rather than restarting. Running the daemon standalone (`RELAY_LAUNCH_FD` unset) skips the handshake entirely.
+
+Full protocol: `relay/docs/launch-identity.md`.
+
 ## Round-trip test
 
 Test the full TTS-to-STT pipeline with a [Kokoro TTS](https://github.com/barelyworkingcode/kokoro) daemon:
