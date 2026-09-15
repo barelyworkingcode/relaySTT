@@ -23,6 +23,7 @@ import warnings
 
 import pinned_transport
 from launch_identity import LaunchIdentityError, establish_launch_identity
+from pinned_transport import is_unix_url
 
 warnings.filterwarnings("ignore")
 
@@ -62,12 +63,26 @@ class RemoteEngine:
     would be visible in the process list.
     """
 
+    # Relay's model.sock 429s on an admission-timeout and 503s with no host
+    # registered — both mean "come back", not "the request is wrong" — so
+    # they get a bounded retry with backoff; every other status is reported
+    # on the first try.
+    _RETRYABLE_STATUS = (429, 503)
+    _MAX_ATTEMPTS = 3
+    _RETRY_BACKOFF_BASE_S = 0.5
+
     def __init__(self, base_url=None, model=None, api_key_env=None, timeout=120.0,
                  ca_file=None, pins=None):
         self.base_url = (os.environ.get("RELAYSTT_REMOTE_URL") or base_url or "").rstrip("/")
+        # `unix:<path>` means HTTP over AF_UNIX against relay's model.sock:
+        # relay identifies this daemon by its launch identity on that
+        # socket, never by a header, so no CA/pin/API-key setting below
+        # applies to it.
+        self.is_unix = is_unix_url(self.base_url)
         self.model = os.environ.get("RELAYSTT_REMOTE_MODEL") or model or ""
         self.timeout = timeout
-        self.api_key = os.environ.get(api_key_env or "RELAYSTT_REMOTE_API_KEY") or None
+        api_key_env = api_key_env or "RELAYSTT_REMOTE_API_KEY"
+        self.api_key = os.environ.get(api_key_env) or None
         self.ca_file = os.environ.get("RELAYSTT_REMOTE_CA") or ca_file or None
         pin_source = os.environ.get("RELAYSTT_REMOTE_PIN_SHA256") or pins
 
@@ -82,10 +97,28 @@ class RemoteEngine:
 
         self.pins = pinned_transport.parse_pins(pin_source)
         pinned_transport.assert_transport_config(self.base_url, self.ca_file, self.pins)
+
+        if self.is_unix and self.api_key:
+            # Deliberate: an Authorization header on the unix path is judged
+            # as a bearer credential by relay's model endpoint, never as this
+            # service's own identity — sending one can only make the call
+            # worse (a mismatched-header 401), never better. Name the
+            # variable, never the value, since this print can reach a shared
+            # log.
+            print(f"remote STT: {api_key_env} is set but ignored on the unix "
+                  "transport (relay identifies this service by its launch "
+                  "identity, not a bearer header)")
+            self.api_key = None
+
         self._opener = pinned_transport.build_opener(self.base_url, self.ca_file, self.pins)
 
     @property
     def url(self):
+        # Fixed base path: relay's model endpoint is rooted at /v1 regardless
+        # of the socket path after `unix:`, which names the socket file, not
+        # a URL prefix.
+        if self.is_unix:
+            return "unix://model.sock/v1/audio/transcriptions"
         return f"{self.base_url}/audio/transcriptions"
 
     @property
@@ -132,6 +165,43 @@ class RemoteEngine:
         out += f"\r\n--{boundary}--\r\n".encode()
         return bytes(out), f"multipart/form-data; boundary={boundary}"
 
+    @staticmethod
+    def _status_hint(code: int) -> str:
+        """A relay-specific hint prepended to the upstream's own error detail,
+        for the two statuses relay's model endpoint gives a fixed meaning to
+        regardless of what sits behind it."""
+        if code == 401:
+            return "not authorised by relay: does this service hold the models capability? "
+        if code == 404:
+            return "model not allowed or unknown: check allowed_models — "
+        return ""
+
+    def _call_transcribe_endpoint(self, req: urllib.request.Request) -> bytes:
+        """POST `req` and return the response body, or raise RuntimeError.
+
+        429 (admission timeout) and 503 (no model host registered) mean
+        "come back", not "the request is wrong" — relay's own busy/
+        unavailable signals — so they get a bounded retry with backoff;
+        every other status is reported on the first try.
+        """
+        for attempt in range(self._MAX_ATTEMPTS):
+            try:
+                with self._opener.open(req, timeout=self.timeout) as resp:
+                    return resp.read()
+            except urllib.error.HTTPError as e:
+                detail = self._error_detail(e.read())
+                if (e.code in self._RETRYABLE_STATUS
+                        and attempt < self._MAX_ATTEMPTS - 1):
+                    time.sleep(self._RETRY_BACKOFF_BASE_S * (2 ** attempt))
+                    continue
+                raise RuntimeError(
+                    f"remote STT {self.label} returned HTTP {e.code}: "
+                    f"{self._status_hint(e.code)}{detail}") from None
+            except urllib.error.URLError as e:
+                raise RuntimeError(
+                    f"remote STT {self.label} unreachable: {e.reason}") from None
+        raise AssertionError("unreachable: loop always returns or raises")
+
     def transcribe(self, wav_path, language=None):
         """Send one clip and return {text, language}. Raises RuntimeError with
         the endpoint and reason on any failure, so the caller can answer the
@@ -151,16 +221,7 @@ class RemoteEngine:
         if self.api_key:
             req.add_header("Authorization", f"Bearer {self.api_key}")
 
-        try:
-            with self._opener.open(req, timeout=self.timeout) as resp:
-                payload = resp.read()
-        except urllib.error.HTTPError as e:
-            raise RuntimeError(
-                f"remote STT {self.label} returned HTTP {e.code}: "
-                f"{self._error_detail(e.read())}") from None
-        except urllib.error.URLError as e:
-            raise RuntimeError(
-                f"remote STT {self.label} unreachable: {e.reason}") from None
+        payload = self._call_transcribe_endpoint(req)
 
         try:
             result = json.loads(payload)
