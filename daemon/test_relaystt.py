@@ -10,14 +10,18 @@ import http.server
 import io
 import json
 import os
+import re
 import shutil
 import socket
+import socketserver
 import ssl
 import struct
 import subprocess
 import sys
+import tempfile
 import threading
 import urllib.error
+from contextlib import contextmanager
 
 import numpy as np
 import soundfile as sf
@@ -764,6 +768,365 @@ def test_env_overrides_cli_for_ca_and_pins(tls_certs, monkeypatch):
                      ca_file=tls_certs["ca_crt"], pins=tls_certs["leaf2_fp"])
     assert e.ca_file == tls_certs["leaf1_crt"]
     assert e.pins == [tls_certs["leaf1_fp"]]
+
+
+# ── unix:<path> transport: relay's model.sock ──────────────────────
+#
+# A real OpenAI-compatible HTTP server on a real AF_UNIX socket — no mock of
+# the socket layer — mirroring _FakeBridge's pattern above. `responses` is a
+# list of (status, error_body_or_None) consumed in order; once exhausted the
+# last entry repeats, so a test that wants "always 503" just passes one entry.
+
+def _parse_multipart_fields(content_type: str, body: bytes) -> dict:
+    """Parse a multipart/form-data body into {field_name: bytes value}, plus
+    the file part's filename under '__filename__'. Good enough for the small,
+    hand-encoded bodies RemoteEngine._encode_multipart produces -- not a
+    general MIME parser."""
+    boundary = content_type.split("boundary=", 1)[1].strip()
+    delim = b"--" + boundary.encode()
+    fields = {}
+    for part in body.split(delim):
+        part = part[2:] if part.startswith(b"\r\n") else part
+        header_blob, sep, value = part.partition(b"\r\n\r\n")
+        if not sep:
+            continue
+        headers = header_blob.decode("utf-8", "replace")
+        m = re.search(r'name="([^"]+)"', headers)
+        if not m:
+            continue
+        name = m.group(1)
+        if value.endswith(b"\r\n"):
+            value = value[:-2]
+        if name == "file":
+            fm = re.search(r'filename="([^"]+)"', headers)
+            fields["__filename__"] = fm.group(1) if fm else None
+        fields[name] = value
+    return fields
+
+
+class _FakeModelSockHandler(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"  # keep-alive, so the reuse test means something
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", "0"))
+        raw = self.rfile.read(length)
+        content_type = self.headers.get("Content-Type", "")
+        self.server.record({
+            "path": self.path,
+            "headers": {k.lower(): v for k, v in self.headers.items()},
+            "content_type": content_type,
+            "body": raw,
+            "fields": (_parse_multipart_fields(content_type, raw)
+                       if content_type.startswith("multipart/form-data") else {}),
+        })
+        status, error_body = self.server.next_response()
+        if status == 200:
+            body = json.dumps({"text": "unix ok", "language": "en"}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        else:
+            body = json.dumps(error_body or {"error": {"message": "denied"}}).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    def log_message(self, *a):
+        pass
+
+
+class _FakeModelSockServer(socketserver.ThreadingUnixStreamServer):
+    daemon_threads = True
+
+    def __init__(self, sock_path, responses):
+        self._lock = threading.Lock()
+        self.requests = []
+        self.connection_count = 0
+        self.responses = list(responses)
+        super().__init__(sock_path, _FakeModelSockHandler)
+
+    def get_request(self):
+        conn, addr = super().get_request()
+        with self._lock:
+            self.connection_count += 1
+        return conn, addr
+
+    def record(self, entry):
+        with self._lock:
+            self.requests.append(entry)
+
+    def next_response(self):
+        with self._lock:
+            if len(self.responses) > 1:
+                return self.responses.pop(0)
+            return self.responses[0]
+
+
+@contextmanager
+def _model_sock_server(responses=((200, None),)):
+    # AF_UNIX paths cap at ~104 bytes on macOS; pytest's tmp_path is too deep
+    # (see _FakeBridge below), so this gets its own short-lived base under /tmp.
+    d = tempfile.mkdtemp(prefix="rstt-model-")
+    sock_path = os.path.join(d, "model.sock")
+    srv = _FakeModelSockServer(sock_path, responses)
+    thread = threading.Thread(target=srv.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield srv, sock_path
+    finally:
+        srv.shutdown()
+        srv.server_close()
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_unix_url_relative_path_refused():
+    for bad in ("unix:relative/path.sock", "unix:", "unix:~/model.sock"):
+        try:
+            pinned_transport.assert_transport_config(bad, None, [])
+        except ValueError as e:
+            assert "absolute path" in str(e)
+        else:
+            raise AssertionError(f"expected ValueError for {bad!r}")
+
+
+def test_unix_url_absolute_path_is_ok():
+    pinned_transport.assert_transport_config("unix:/tmp/model.sock", None, [])
+
+
+def test_unix_url_with_ca_file_is_fatal(tmp_path):
+    ca = tmp_path / "ca.pem"
+    ca.write_text("irrelevant — rejected before it would be read")
+    try:
+        pinned_transport.assert_transport_config("unix:/tmp/model.sock", str(ca), [])
+    except ValueError as e:
+        assert "unix" in str(e)
+    else:
+        raise AssertionError("expected ValueError")
+
+
+def test_unix_url_with_pins_is_fatal():
+    try:
+        pinned_transport.assert_transport_config("unix:/tmp/model.sock", None, [_SAMPLE_FP])
+    except ValueError as e:
+        assert "unix" in str(e)
+    else:
+        raise AssertionError("expected ValueError")
+
+
+def test_remote_engine_rejects_relative_unix_path():
+    try:
+        RemoteEngine(base_url="unix:relative.sock", model="m")
+    except ValueError as e:
+        assert "absolute path" in str(e)
+    else:
+        raise AssertionError("expected ValueError")
+
+
+def test_unix_transport_sends_expected_request_no_auth_header(tmp_path):
+    with _model_sock_server() as (srv, sock_path):
+        e = RemoteEngine(base_url=f"unix:{sock_path}", model="up/asr")
+        assert e.url == "unix://model.sock/v1/audio/transcriptions"
+        result = e.transcribe(_wav(tmp_path))
+        assert result["text"] == "unix ok"
+        assert len(srv.requests) == 1
+        req = srv.requests[0]
+        assert req["path"] == "/v1/audio/transcriptions"
+        assert "authorization" not in req["headers"]
+        assert "x-api-key" not in req["headers"]
+
+
+def test_unix_transport_multipart_model_field_present(tmp_path):
+    """The one real difference from a JSON-bodied remote (TTS): relaySTT
+    posts multipart/form-data. A transport switch must not silently drop or
+    rename the `model` field -- relay's broker extracts `model` from either a
+    JSON key or a multipart part to authorize the call, so a missing field
+    here would surface as a confusing 400/404 from relay rather than a clear
+    local bug."""
+    audio = b"RIFF" + bytes(range(256))
+    path = _wav(tmp_path, audio)
+    with _model_sock_server() as (srv, sock_path):
+        e = RemoteEngine(base_url=f"unix:{sock_path}", model="up/asr")
+        e.transcribe(path, language="en")
+
+        assert len(srv.requests) == 1
+        req = srv.requests[0]
+        assert req["content_type"].startswith("multipart/form-data; boundary=")
+        fields = req["fields"]
+        assert fields["model"] == b"up/asr"
+        assert fields["language"] == b"en"
+        assert fields["file"] == audio
+        assert fields["__filename__"] == "clip.wav"
+
+
+def test_unix_transport_ignores_configured_api_key_with_warning(tmp_path, monkeypatch, capsys):
+    with _model_sock_server() as (srv, sock_path):
+        monkeypatch.setenv("RELAYSTT_REMOTE_API_KEY", "s3cret-value")
+        e = RemoteEngine(base_url=f"unix:{sock_path}", model="m")
+        out = capsys.readouterr().out
+        assert "RELAYSTT_REMOTE_API_KEY" in out
+        assert "s3cret-value" not in out
+        assert e.api_key is None
+
+        e.transcribe(_wav(tmp_path))
+        assert "authorization" not in srv.requests[0]["headers"]
+
+
+def test_unix_transport_api_key_canary_never_sent_or_logged(tmp_path, monkeypatch, capsys):
+    """The value must not leak into a request header or anything printed,
+    whatever the daemon does with it internally."""
+    canary = "CANARY-" + "f" * 40
+    with _model_sock_server() as (srv, sock_path):
+        monkeypatch.setenv("RELAYSTT_REMOTE_API_KEY", canary)
+        e = RemoteEngine(base_url=f"unix:{sock_path}", model="m")
+        e.transcribe(_wav(tmp_path))
+    out = capsys.readouterr().out
+    assert canary not in out
+    req = srv.requests[0]
+    assert canary.encode() not in req["body"]
+    assert canary not in json.dumps(req["headers"])
+
+
+def test_https_config_still_sends_bearer_when_configured(tmp_path, monkeypatch):
+    """Guards against the unix-only api_key suppression leaking onto the
+    https path -- same assertion as test_bearer_sent_only_when_configured,
+    kept here as a contrast to the unix behaviour above."""
+    monkeypatch.setenv("RELAYSTT_REMOTE_API_KEY", "tok")
+    e = RemoteEngine(base_url="https://198.51.100.10:8080/v1", model="up/asr")
+    seen = _capture(e, monkeypatch)
+    e.transcribe(_wav(tmp_path))
+    assert seen["headers"]["Authorization"] == "Bearer tok"
+
+
+def test_unix_transport_401_gives_clear_message(tmp_path):
+    with _model_sock_server(responses=[(401, {"error": "unauthorized"})]) as (srv, sock_path):
+        e = RemoteEngine(base_url=f"unix:{sock_path}", model="m")
+        try:
+            e.transcribe(_wav(tmp_path))
+        except RuntimeError as err:
+            assert "not authorised by relay" in str(err) and "models capability" in str(err)
+        else:
+            raise AssertionError("expected RuntimeError")
+
+
+def test_unix_transport_404_gives_clear_message(tmp_path):
+    with _model_sock_server(responses=[(404, {"error": "not found"})]) as (srv, sock_path):
+        e = RemoteEngine(base_url=f"unix:{sock_path}", model="m")
+        try:
+            e.transcribe(_wav(tmp_path))
+        except RuntimeError as err:
+            assert "model not allowed or unknown" in str(err)
+        else:
+            raise AssertionError("expected RuntimeError")
+
+
+def test_unix_transport_429_retries_then_succeeds(tmp_path, monkeypatch):
+    monkeypatch.setattr(relaystt_daemon.time, "sleep", lambda s: None)
+    responses = [(429, {"error": "rate_limited"}), (429, {"error": "rate_limited"}), (200, None)]
+    with _model_sock_server(responses=responses) as (srv, sock_path):
+        e = RemoteEngine(base_url=f"unix:{sock_path}", model="m")
+        result = e.transcribe(_wav(tmp_path))
+        assert result["text"] == "unix ok"
+        assert len(srv.requests) == 3
+
+
+def test_unix_transport_503_retries_then_gives_up(tmp_path, monkeypatch):
+    monkeypatch.setattr(relaystt_daemon.time, "sleep", lambda s: None)
+    with _model_sock_server(responses=[(503, {"error": "model host unavailable"})]) as (srv, sock_path):
+        e = RemoteEngine(base_url=f"unix:{sock_path}", model="m")
+        try:
+            e.transcribe(_wav(tmp_path))
+        except RuntimeError as err:
+            assert "HTTP 503" in str(err)
+        else:
+            raise AssertionError("expected RuntimeError")
+        assert len(srv.requests) == RemoteEngine._MAX_ATTEMPTS
+
+
+def test_unix_transport_reuses_connection_across_requests(tmp_path):
+    with _model_sock_server() as (srv, sock_path):
+        e = RemoteEngine(base_url=f"unix:{sock_path}", model="m")
+        for _ in range(20):
+            e.transcribe(_wav(tmp_path))
+        assert len(srv.requests) == 20
+        # Bounded well under N: a fresh connection per call would be 20.
+        assert srv.connection_count <= 2
+
+
+def test_unix_transport_real_connected_socket_is_af_unix(tmp_path):
+    """Reaches into the opener's live connection after a real request and
+    checks the actual OS socket's family -- proof from the wire, not from
+    reading _UnixHTTPConnection.connect() and trusting it."""
+    with _model_sock_server() as (srv, sock_path):
+        e = RemoteEngine(base_url=f"unix:{sock_path}", model="m")
+        e.transcribe(_wav(tmp_path))
+        live_sock = e._opener._conn.sock
+        assert live_sock.family == socket.AF_UNIX
+
+
+def test_unix_transport_refuses_a_non_af_unix_socket():
+    """The family guard in _UnixHTTPConnection.connect() is unreachable on
+    the code as written (the socket it creates is always AF_UNIX) -- this
+    defeats it directly by forcing a non-AF_UNIX socket through the same
+    code path, proving the guard itself (not just today's caller) raises."""
+    conn = pinned_transport._UnixHTTPConnection("/tmp/does-not-matter.sock")
+    real_socket = socket.socket
+
+    def fake_socket(family, kind):
+        return real_socket(socket.AF_INET, socket.SOCK_STREAM)
+
+    orig = socket.socket
+    socket.socket = fake_socket
+    try:
+        try:
+            conn.connect()
+        except AssertionError as e:
+            assert "AF_UNIX" in str(e)
+        else:
+            raise AssertionError("expected the family guard to fire")
+    finally:
+        socket.socket = orig
+
+
+def test_unix_transport_decodes_chunked_response(tmp_path):
+    """Transfer-Encoding: chunked, written by hand -- exercises the same
+    http.client chunked-decoding path a streaming upstream would use."""
+    class _ChunkedHandler(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", "0"))
+            self.rfile.read(length)
+            body = json.dumps({"text": "chunked ok", "language": "en"}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+            mid = len(body) // 2
+            for chunk in (body[:mid], body[mid:]):
+                self.wfile.write(b"%x\r\n%s\r\n" % (len(chunk), chunk))
+            self.wfile.write(b"0\r\n\r\n")
+
+        def log_message(self, *a):
+            pass
+
+    d = tempfile.mkdtemp(prefix="rstt-model-chunked-")
+    sock_path = os.path.join(d, "model.sock")
+    srv = socketserver.ThreadingUnixStreamServer(sock_path, _ChunkedHandler)
+    srv.daemon_threads = True
+    thread = threading.Thread(target=srv.serve_forever, daemon=True)
+    thread.start()
+    try:
+        e = RemoteEngine(base_url=f"unix:{sock_path}", model="m")
+        result = e.transcribe(_wav(tmp_path))
+        assert result["text"] == "chunked ok"
+    finally:
+        srv.shutdown()
+        srv.server_close()
+        shutil.rmtree(d, ignore_errors=True)
 
 
 # ── relay launch identity (fd 3 secret + Hello) ──────────────────
