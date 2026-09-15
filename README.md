@@ -38,7 +38,7 @@ This will:
 2. Install `ffmpeg` via Homebrew if not present
 3. Register the daemon with [Relay](https://relay.dev) for auto-start (if Relay is installed)
 
-`RELAYSTT_REMOTE_URL` and `RELAYSTT_REMOTE_MODEL` are required the first time a machine registers the service — the daemon loads no model of its own, so without an endpoint it would come up and answer `ping` while failing every transcription.
+`RELAYSTT_REMOTE_MODEL` is required the first time a machine registers the service — the daemon loads no model of its own, so without one it would come up and answer `ping` while failing every transcription. `RELAYSTT_REMOTE_URL` is required too *unless* Relay is installed, in which case `build.sh` defaults it to Relay's own model socket (see "Remote via relay's model socket" below).
 
 ## Usage
 
@@ -130,6 +130,48 @@ Get a certificate's fingerprint with:
 ```bash
 openssl s_client -connect host:port </dev/null 2>/dev/null | openssl x509 -fingerprint -sha256 -noout
 ```
+
+### Remote via relay's model socket
+
+`RELAYSTT_REMOTE_URL` also accepts `unix:<absolute path>` — HTTP over
+`AF_UNIX` against relay's own model endpoint instead of a
+directly-configured server. `build.sh` defaults to this
+(`unix:$HOME/Library/Application Support/relay/model.sock`) whenever Relay
+is installed and no `RELAYSTT_REMOTE_URL` is given.
+
+- The base path is always `/v1` — the socket path names the socket file, not
+  a URL prefix.
+- **No `Authorization` or `x-api-key` header is ever sent on this path.**
+  Relay identifies the daemon by its launch identity (the kernel's audit
+  token on the connection), not by a header — a header would be judged as a
+  bearer credential instead and can only make the call worse. A configured
+  `RELAYSTT_REMOTE_API_KEY` (or whatever `--remote-api-key-env` names) is
+  ignored, with a one-line startup warning naming the variable, never its
+  value.
+- `RELAYSTT_REMOTE_CA` / `RELAYSTT_REMOTE_PIN_SHA256` don't apply here —
+  there is no TLS layer on `AF_UNIX` — and `assert_transport_config` refuses
+  startup if either is set alongside a `unix:` URL, the same "would be a
+  false sense of safety" rule plain `http` already gets.
+- The path after `unix:` must be absolute; a relative one is refused at
+  startup with a clear message.
+- One connection is opened per daemon process and reused (HTTP keep-alive)
+  across requests rather than one dialed and torn down per transcription.
+- The `model` field still travels as a multipart part (same as any other
+  transport here) — relay's model endpoint extracts `model` from either a
+  JSON key or a multipart part to authorize the call.
+- Relay's model endpoint returns 401 if this service doesn't hold the
+  `models` capability, and the same 404 for a model that's unknown as for
+  one that isn't in `--allowed-model`; 429 (admission timeout) and 503 (no
+  model host registered) are retried with backoff.
+- **Registering the `models` capability is presence-gated** — `build.sh`'s
+  `relay service register` call raises a real macOS confirmation dialog and
+  must be run at the console, not over SSH. If the service is already
+  registered, `build.sh` prints the exact `unregister`-then-`register`
+  command needed to pick up the capability change; there is no in-place
+  update. `build.sh` only requests `models` when `RELAYSTT_REMOTE_URL` is
+  actually `unix:*` — a plain `https://` remote never calls relay's model
+  socket, so granting the capability there would sit on the service record
+  unused.
 
 ## Relay launch identity
 
