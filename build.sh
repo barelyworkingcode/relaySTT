@@ -4,7 +4,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Ensure conda environment exists
-if ! conda info --envs 2>/dev/null | grep -q "^relaystt "; then
+CONDA_ENVS="$(conda info --envs 2>/dev/null || true)"
+if ! grep -q "^relaystt " <<< "$CONDA_ENVS"; then
     echo "Setting up conda environment..."
     "$SCRIPT_DIR/setup_env.sh"
 fi
@@ -12,8 +13,12 @@ fi
 # Register with Relay (best-effort)
 RELAY="/Applications/Relay.app/Contents/MacOS/relay"
 if [ -x "$RELAY" ]; then
+    # Capture before grep: `service list | grep -q` under pipefail exits 141
+    # (SIGPIPE) when grep exits on a match before the list finishes writing,
+    # which would make an already-registered daemon look unregistered.
+    SERVICE_LIST="$("$RELAY" service list 2>/dev/null || true)"
     ALREADY_REGISTERED=0
-    if "$RELAY" service list 2>/dev/null | grep -q "relaystt-daemon"; then
+    if grep -q "relaystt-daemon" <<< "$SERVICE_LIST"; then
         ALREADY_REGISTERED=1
     fi
 
