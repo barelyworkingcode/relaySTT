@@ -7,6 +7,7 @@ Accepts base64-encoded audio and returns transcribed text in JSON responses.
 import argparse
 import base64
 import binascii
+import contextlib
 import json
 import os
 import socket
@@ -21,6 +22,7 @@ import urllib.request
 import uuid
 import warnings
 
+import log_line
 import pinned_transport
 from launch_identity import LaunchIdentityError, establish_launch_identity
 from pinned_transport import is_unix_url
@@ -103,11 +105,12 @@ class RemoteEngine:
             # as a bearer credential by relay's model endpoint, never as this
             # service's own identity — sending one can only make the call
             # worse (a mismatched-header 401), never better. Name the
-            # variable, never the value, since this print can reach a shared
+            # variable, never the value, since this log line can reach a shared
             # log.
-            print(f"remote STT: {api_key_env} is set but ignored on the unix "
-                  "transport (relay identifies this service by its launch "
-                  "identity, not a bearer header)")
+            log_line.warn(
+                f"remote STT: {api_key_env} is set but ignored on the unix "
+                "transport (relay identifies this service by its launch "
+                "identity, not a bearer header)", op="service.start")
             self.api_key = None
 
         self._opener = pinned_transport.build_opener(self.base_url, self.ca_file, self.pins)
@@ -220,6 +223,11 @@ class RemoteEngine:
             headers={"Content-Type": content_type})
         if self.api_key:
             req.add_header("Authorization", f"Bearer {self.api_key}")
+        # The trace id is meaningless off the box, so it only goes to an
+        # on-box endpoint (relay's model socket or loopback).
+        trace_id = log_line.current_trace_id()
+        if trace_id and log_line.is_on_box_url(self.base_url):
+            req.add_header("X-Trace-Id", trace_id)
 
         payload = self._call_transcribe_endpoint(req)
 
@@ -264,7 +272,8 @@ class RelaySTTDaemon:
             return
         while self.running:
             if self.check_idle_timeout():
-                print(f"Daemon idle for {self.idle_timeout // 60} minutes, shutting down...")
+                log_line.info(f"daemon idle for {self.idle_timeout // 60} minutes, shutting down",
+                              op="service.stop")
                 self.running = False
                 break
             time.sleep(30)
@@ -278,8 +287,16 @@ class RelaySTTDaemon:
         # malformed/empty buffer (e.g. a truncated or zero-length capture) is
         # not worth a network round trip, so bail with an empty result instead.
         # A valid WAV header alone is 44 bytes.
+        started = time.monotonic()
+
+        def elapsed_ms():
+            return int((time.monotonic() - started) * 1000)
+
         if not audio_bytes or len(audio_bytes) < 44:
-            print(f"Rejecting tiny audio payload ({len(audio_bytes) if audio_bytes else 0} bytes)")
+            log_line.warn(
+                f"rejecting tiny audio payload ({len(audio_bytes) if audio_bytes else 0} bytes)",
+                op="stt.transcribe", status="error", error="audio payload too small",
+                duration_ms=elapsed_ms())
             return self._empty_result(language)
 
         # Write audio to a temp file (the remote engine sends a file path)
@@ -299,9 +316,15 @@ class RelaySTTDaemon:
                 import soundfile as sf
                 duration = sf.info(wav_path).duration
             except Exception as e:
-                print(f"Unreadable audio, skipping transcription: {e}")
+                log_line.warn("unreadable audio, skipping transcription",
+                              op="stt.transcribe", status="error",
+                              error=f"unreadable audio ({type(e).__name__})",
+                              duration_ms=elapsed_ms())
                 return self._empty_result(language)
             if duration <= 0:
+                log_line.info("audio has no duration, skipping transcription",
+                              op="stt.transcribe", status="ok",
+                              duration_ms=elapsed_ms())
                 return self._empty_result(language)
             if duration > MAX_AUDIO_SECONDS:
                 raise ValueError(f"audio too long ({duration:.0f}s > {MAX_AUDIO_SECONDS:.0f}s)")
@@ -313,7 +336,10 @@ class RelaySTTDaemon:
             text = result.get("text", "").strip()
             detected_lang = result.get("language", language or "unknown")
 
-            print(f"Transcribed: {duration:.1f}s audio in {transcription_time:.2f}s lang={detected_lang} chars={len(text)}")
+            log_line.info(
+                f"transcribed {duration:.1f}s audio in {transcription_time:.2f}s "
+                f"lang={detected_lang} chars={len(text)}",
+                op="stt.transcribe", status="ok", duration_ms=elapsed_ms())
 
             return {
                 "text": text,
@@ -352,10 +378,15 @@ class RelaySTTDaemon:
             )
             return wav_path
         except subprocess.CalledProcessError as e:
-            stderr = (e.stderr or b"")[:200].decode("utf-8", "replace")
-            print(f"ffmpeg conversion failed: {e}: {stderr}, trying raw input...")
+            # Neither ffmpeg's stderr nor str(e) is logged: both can echo the
+            # command line and file paths.
+            log_line.warn("ffmpeg conversion failed, trying raw input",
+                          op="audio.convert", status="error",
+                          error=f"ffmpeg exit code {e.returncode}")
         except (FileNotFoundError, subprocess.TimeoutExpired) as e:
-            print(f"ffmpeg conversion failed: {e}, trying raw input...")
+            log_line.warn("ffmpeg conversion failed, trying raw input",
+                          op="audio.convert", status="error",
+                          error=type(e).__name__)
         # A partial file here would otherwise sit in TMPDIR forever: the caller
         # is about to fall back to input_path, so nothing else ever cleans it up.
         if os.path.exists(wav_path):
@@ -403,6 +434,10 @@ class RelaySTTDaemon:
     # -- Client handling --
 
     def handle_client(self, client_socket, addr):
+        # Trace scope opens once the request names its id; until then (and
+        # for a ping or a bad frame) no id is in scope.
+        scope = contextlib.ExitStack()
+        started = time.monotonic()
         try:
             self.update_activity()
             request = self._recv_request(client_socket)
@@ -413,20 +448,29 @@ class RelaySTTDaemon:
                 return
 
             # Transcription request
+            scope.enter_context(log_line.trace_scope(
+                log_line.accept_trace_id(request.get("trace_id"))))
+            def refuse(reason, response):
+                log_line.warn(
+                    f"request refused: {reason}", op="stt.transcribe",
+                    status="denied", error=reason,
+                    duration_ms=int((time.monotonic() - started) * 1000))
+                self._send_response(client_socket, response)
+
             audio_b64 = request.get("audio_base64", "")
             if not isinstance(audio_b64, str) or not audio_b64:
-                self._send_response(client_socket, {"success": False, "error": "No audio_base64 provided"})
+                refuse("no audio_base64", {"success": False, "error": "No audio_base64 provided"})
                 return
 
             language = request.get("language")
             if language is not None and (not isinstance(language, str) or len(language) > 16):
-                self._send_response(client_socket, {"success": False, "error": "language must be a short string"})
+                refuse("bad language", {"success": False, "error": "language must be a short string"})
                 return
 
             try:
                 audio_bytes = base64.b64decode(audio_b64, validate=True)
             except binascii.Error:
-                self._send_response(client_socket, {"success": False, "error": "audio_base64 is not valid base64"})
+                refuse("invalid base64", {"success": False, "error": "audio_base64 is not valid base64"})
                 return
 
             result = self.transcribe(audio_bytes, language)
@@ -441,12 +485,20 @@ class RelaySTTDaemon:
             # Nothing to answer and nothing worth saying.
             return
         except Exception as e:
-            print(f"Error handling client {addr}: {e}")
+            # Only a plain ValueError (raised here, with our own wording) has its
+            # text logged. Every other type, RuntimeError and http/connection
+            # errors included, can embed a remote body or address: type only.
+            msg = " ".join(str(e).split())[:120] if type(e) is ValueError else ""
+            log_line.error(
+                "request failed", op="stt.transcribe", status="error",
+                error=f"{type(e).__name__}: {msg}" if msg else type(e).__name__,
+                duration_ms=int((time.monotonic() - started) * 1000))
             try:
                 self._send_response(client_socket, {"success": False, "error": str(e)})
             except:
                 pass
         finally:
+            scope.close()
             client_socket.close()
 
     # -- Server lifecycle --
@@ -455,8 +507,9 @@ class RelaySTTDaemon:
         # Nothing to load: no local model, no weights. A bad endpoint surfaces
         # per-request rather than blocking startup, so the daemon still comes
         # up if the remote host is booting behind it.
-        print(f"Remote engine: {self.engine.label} "
-              f"(model={self.engine.model}) — no local model is loaded")
+        log_line.info(f"remote engine: {self.engine.label} "
+                      f"(model={self.engine.model}), no local model is loaded",
+                      op="service.start")
 
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -465,11 +518,10 @@ class RelaySTTDaemon:
         self.sock.listen(LISTEN_BACKLOG)
         self.running = True
 
-        print(f"relaySTT Daemon started on {self.host}:{self.port}")
-        if self.idle_timeout > 0:
-            print(f"Auto-shutdown after {self.idle_timeout // 60} minutes idle")
-        else:
-            print("Idle timeout disabled")
+        idle = (f"auto-shutdown after {self.idle_timeout // 60} minutes idle"
+                if self.idle_timeout > 0 else "idle timeout disabled")
+        log_line.info(f"relaySTT daemon started on {self.host}:{self.port}; {idle}",
+                      op="service.start")
 
         self.update_activity()
 
@@ -490,10 +542,11 @@ class RelaySTTDaemon:
                     continue
                 except socket.error:
                     if self.running:
-                        print("Socket error")
+                        log_line.error("socket error on accept", op="service.start",
+                                       status="error", error="socket error")
                     break
         except KeyboardInterrupt:
-            print("\nStopping daemon...")
+            log_line.info("stopping daemon (interrupt)", op="service.stop")
         finally:
             self.stop()
 
@@ -501,7 +554,7 @@ class RelaySTTDaemon:
         self.running = False
         if self.sock:
             self.sock.close()
-        print("Daemon stopped")
+        log_line.info("daemon stopped", op="service.stop")
 
 
 def establish_relay_identity() -> bool:
@@ -510,10 +563,11 @@ def establish_relay_identity() -> bool:
     try:
         bound = establish_launch_identity()
     except LaunchIdentityError as e:
-        print(f"relay launch identity failed: {e}", file=sys.stderr)
+        log_line.error("relay launch identity failed", op="service.start",
+                       status="error", error=" ".join(str(e).split())[:200])
         sys.exit(78)
     if bound:
-        print("Relay launch identity established")
+        log_line.info("relay launch identity established", op="service.start")
     return bound
 
 

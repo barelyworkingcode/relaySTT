@@ -443,7 +443,7 @@ def test_transcript_text_not_logged(monkeypatch, capsys):
 
     d.transcribe(audio_bytes)
 
-    out = capsys.readouterr().out
+    out = capsys.readouterr().err
     assert secret_text not in out
     assert "chars=" in out
 
@@ -966,7 +966,7 @@ def test_unix_transport_ignores_configured_api_key_with_warning(tmp_path, monkey
     with _model_sock_server() as (srv, sock_path):
         monkeypatch.setenv("RELAYSTT_REMOTE_API_KEY", "s3cret-value")
         e = RemoteEngine(base_url=f"unix:{sock_path}", model="m")
-        out = capsys.readouterr().out
+        out = capsys.readouterr().err
         assert "RELAYSTT_REMOTE_API_KEY" in out
         assert "s3cret-value" not in out
         assert e.api_key is None
@@ -983,7 +983,7 @@ def test_unix_transport_api_key_canary_never_sent_or_logged(tmp_path, monkeypatc
         monkeypatch.setenv("RELAYSTT_REMOTE_API_KEY", canary)
         e = RemoteEngine(base_url=f"unix:{sock_path}", model="m")
         e.transcribe(_wav(tmp_path))
-    out = capsys.readouterr().out
+    out = capsys.readouterr().err
     assert canary not in out
     req = srv.requests[0]
     assert canary.encode() not in req["body"]
