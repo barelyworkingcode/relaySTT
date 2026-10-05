@@ -23,7 +23,7 @@ jobs:
         with:
           python-version: "3.11"
       # The daemon is a thin protocol shell: no model, no Apple-only package.
-      # Two tests drive the real ffmpeg time-stretch; without it they skip.
+      # One test runs the real ffmpeg conversion; without ffmpeg it skips.
       - name: install ffmpeg
         run: sudo apt-get install -y --no-install-recommends ffmpeg
       - name: install test dependencies
